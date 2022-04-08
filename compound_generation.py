@@ -1,12 +1,19 @@
 # Copyright (C) 2019 Computational Science Lab, UPF <http://www.compscience.org/>
 # Copying and distribution is allowed under AGPLv3 license
+# Captioning network for BycycleGAN (https://github.com/junyanz/BicycleGAN) and
+# Modified from Ligdream (https://github.com/compsciencelab/ligdream)
+# Modification of the original code to use libmolgrid for input preparation 8/04/22
 
-from .networks import EncoderCNN, DecoderRNN, LigandVAE
-from .generators import generate_representation, generate_sigmas, voxelize
-from .decoding import decode_smiles
-from rdkit import Chem
+from networks import EncoderCNN, DecoderRNN, LigandVAE
+from generators import makecanonical
+from decoding import decode_smiles
 from torch.autograd import Variable
+import molgrid
+from molgrid import Coords2GridFunction
 import torch
+import pybel
+from rdkit import Chem
+import sys
 
 
 def filter_unique_canonical(in_mols):
@@ -19,30 +26,50 @@ def filter_unique_canonical(in_mols):
     return [Chem.MolFromSmiles(x) for x in set(xresults)]  # Check for duplicates and filter out invalids
 
 
-def get_mol_voxels(smile_str):
-    """
-    Generate voxelized representation of a molecule.
-    :param smile_str: string - molecule represented as a string
-    :return: list of torch.Tensors
-    """
-    # Convert smile to 3D structure
-    mol = generate_representation(smile_str)
-    if mol is None:
-        return None
+def get_mol_voxels(smiles):
+    # SMILES to 3D with openbabel
 
-    # Generate sigmas
-    sigmas, coords, lig_center = generate_sigmas(mol)
-    vox = torch.Tensor(voxelize(sigmas, coords, lig_center))
-    return vox[:5], vox[5:]
+    smiles = makecanonical(smiles)
+    mol = pybel.readstring('smi', smiles)
+    mol.addh()
+
+    ff = pybel._forcefields["mmff94"]
+    success = ff.Setup(mol.OBMol)
+    if not success:
+        ff = pybel._forcefields["uff"]
+        success = ff.Setup(mol.OBMol)
+        if not success:
+            sys.exit("Cannot set up forcefield")
+
+    ff.ConjugateGradients(100, 1.0e-3)  # optimize geometry
+    ff.WeightedRotorSearch(100, 25)  # generate conformers
+    ff.ConjugateGradients(250, 1.0e-4)
+    ff.GetCoordinates(mol.OBMol)
+
+    # get 3D coords
+    crds = molgrid.CoordinateSet(mol.OBMol, molgrid.defaultGninaLigandTyper)
+    crds.make_vector_types()
+    center = tuple(crds.center())
+    coordinates = torch.tensor(crds.coords.tonumpy())
+    radii = torch.tensor(crds.radii.tonumpy())
+    types = torch.tensor(crds.type_vector.tonumpy())
+
+    # initialize gridMaker
+    gmaker = molgrid.GridMaker(resolution=1, dimension=23, binary=False,
+                               radius_type_indexed=False, radius_scale=1.0,
+                               gaussian_radius_multiple=1.0)
+
+    grid = Coords2GridFunction.apply(gmaker, center, coordinates, types, radii)
+    return grid
 
 
 class CompoundGenerator:
     def __init__(self, use_cuda=True):
 
         self.use_cuda = False
-        self.encoder = EncoderCNN(5)
+        self.encoder = EncoderCNN(15)
         self.decoder = DecoderRNN(512, 1024, 29, 1)
-        self.vae_model = LigandVAE(use_cuda=use_cuda)
+        self.vae_model = LigandVAE()
 
         self.vae_model.eval()
         self.encoder.eval()
@@ -66,7 +93,6 @@ class CompoundGenerator:
         self.vae_model.load_state_dict(torch.load(vae_weights, map_location='cpu'))
         self.encoder.load_state_dict(torch.load(encoder_weights, map_location='cpu'))
         self.decoder.load_state_dict(torch.load(decoder_weights, map_location='cpu'))
-
 
     def caption_shape(self, in_shapes, probab=False):
         """
@@ -92,7 +118,7 @@ class CompoundGenerator:
         :param n_attemps: int - number of decoding attempts
         :param lam_fact: float - latent space pertrubation factor
         :param probab: boolean - use probabilistic decoding
-        :param filter_unique_canonical: boolean - filter for valid and unique molecules
+        :param filter_unique_valid: boolean - filter for valid and unique molecules
         :return: list of RDKit molecules.
         """
 

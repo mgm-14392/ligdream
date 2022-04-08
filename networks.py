@@ -1,22 +1,25 @@
 # Copyright (C) 2019 Computational Science Lab, UPF <http://www.compscience.org/>
 # Copying and distribution is allowed under AGPLv3 license
+# Captioning network for BycycleGAN (https://github.com/junyanz/BicycleGAN) and
+# Modified from Ligdream (https://github.com/compsciencelab/ligdream)
+# Modification of the original code to use libmolgrid for input preparation 8/04/22
 
 import torch
 import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence
 import numpy as np
-from torch.autograd import Variable
+import torch.utils.data
 import torch.nn.functional as F
+from torch.autograd import Variable
+from torch.nn.utils.rnn import pack_padded_sequence
 
+class VAE(nn.Module):
+    """
+    Variational autoencoder for ligand shapes.
+    This network is used only in training of the shape decoder.
+    """
+    def __init__(self, nc=15, ngf=128, ndf=128, latent_variable_size=512):
+        super(VAE, self).__init__()
 
-########################
-# AutoEncoder Networks #
-########################
-
-class LigandVAE(nn.Module):
-    def __init__(self, nc=5, ngf=128, ndf=128, latent_variable_size=512, use_cuda=False):
-        super(LigandVAE, self).__init__()
-        self.use_cuda = use_cuda
         self.nc = nc
         self.ngf = ngf
         self.ndf = ndf
@@ -57,19 +60,15 @@ class LigandVAE(nn.Module):
         self.bn8 = nn.BatchNorm3d(ndf, 1.e-3)
 
         # up2 12 -> 24
-        self.d5 = nn.ConvTranspose3d(ndf + 32, 32, 3, 2, padding=1, output_padding=1)
+        self.d5 = nn.ConvTranspose3d(ndf, 32, 3, 2, padding=1, output_padding=1)
         self.bn9 = nn.BatchNorm3d(32, 1.e-3)
 
         # Output layer
-        self.d6 = nn.Conv3d(64, nc, 3, 1, padding=1)
-
-        # Condtional encoding
-        self.ce1 = nn.Conv3d(3, 32, 3, 1, 1)
-        self.ce2 = nn.Conv3d(32, 32, 3, 2, 1)
+        self.d6 = nn.Conv3d(32, nc, 3, 1, padding=1)
 
         self.leakyrelu = nn.LeakyReLU(0.2)
         self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
+        self.softmax = nn.Softmax(dim=1)
 
     def encode(self, x):
         h1 = self.leakyrelu(self.bn1(self.e1(x)))
@@ -80,49 +79,40 @@ class LigandVAE(nn.Module):
         h5 = h5.view(-1, 512 * 3 * 3 * 3)
         return self.fc1(h5), self.fc2(h5)
 
-    def reparametrize(self, mu, logvar, factor):
+    def reparametrize(self, mu, logvar):
         std = logvar.mul(0.5).exp_()
-        if self.use_cuda:
-            eps = torch.cuda.FloatTensor(std.size()).normal_()
-        else:
-            eps = torch.FloatTensor(std.size()).normal_()
+        eps = torch.cuda.FloatTensor(std.size()).normal_()
+        eps = eps.to(self.device)
         eps = Variable(eps)
-        return (eps.mul(std) * factor).add_(mu)
+        return eps.mul(std).add_(mu)
 
-    def decode(self, z, cond_x):
-        # Conditional block
-        cc1 = self.relu(self.ce1(cond_x))
-        cc2 = self.relu(self.ce2(cc1))
-
+    def decode(self, z):
         h1 = self.relu(self.d1(z))
         h1 = h1.view(-1, self.ndf * 4, 3, 3, 3)
-        h2 = self.leakyrelu(self.bn6(self.d2((h1))))
+        h2 = self.leakyrelu(self.bn6(self.d2(h1)))
         h3 = self.leakyrelu(self.bn7(self.d3(h2)))
         h4 = self.leakyrelu(self.bn8(self.d4(h3)))
-        h4 = torch.cat([h4, cc2], dim=1)
         h5 = self.leakyrelu(self.bn9(self.d5(h4)))
-        h5 = torch.cat([h5, cc1], dim=1)
-        return self.sigmoid(self.d6(h5))
+        return self.softmax(self.d6(h5))
 
     def get_latent_var(self, x):
         mu, logvar = self.encode(x.view())
         z = self.reparametrize(mu, logvar)
         return z
 
-    def forward(self, x, cond_x, factor=1.):
+    def forward(self, x):
         mu, logvar = self.encode(x)
-        z = self.reparametrize(mu, logvar, factor=factor)
-        res = self.decode(z, cond_x)
+        z = self.reparametrize(mu, logvar)
+        res = self.decode(z)
         return res, mu, logvar
 
 
-#######################
-# Captioning Networks #
-#######################
-
-class EncoderCNN(nn.Module):
-    def __init__(self, in_layers):
-        super(EncoderCNN, self).__init__()
+class EncoderCNN_v3(nn.Module):
+    """
+    CNN :wqnetwork to encode ligand shape into a vectorized representation.
+    """
+    def __init__(self, in_layers=15):
+        super(EncoderCNN_v3, self).__init__()
         self.pool = nn.MaxPool3d((2, 2, 2))
         self.relu = nn.ReLU()
         layers = []
@@ -149,50 +139,55 @@ class EncoderCNN(nn.Module):
 
 
 class DecoderRNN(nn.Module):
+    """
+    RNN network to decode vectorized representation of a compound shape into SMILES string
+    """
     def __init__(self, embed_size, hidden_size, vocab_size, num_layers):
         """Set the hyper-parameters and build the layers."""
         super(DecoderRNN, self).__init__()
+        self.hidden_size = hidden_size
         self.embed = nn.Embedding(vocab_size, embed_size)
         self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=True)
         self.linear = nn.Linear(hidden_size, vocab_size)
         self.init_weights()
 
     def init_weights(self):
+        """Initialize weights."""
         self.embed.weight.data.uniform_(-0.1, 0.1)
         self.linear.weight.data.uniform_(-0.1, 0.1)
         self.linear.bias.data.fill_(0)
 
     def forward(self, features, captions, lengths):
-        """Decode shapes feature vectors and generates SMILES."""
+        """Decode image feature vectors and generates captions."""
         embeddings = self.embed(captions)
         embeddings = torch.cat((features.unsqueeze(1), embeddings), 1)
-        packed = pack_padded_sequence(embeddings, lengths, batch_first=True)
+        packed = pack_padded_sequence(embeddings, lengths, batch_first=True, enforce_sorted=False)
         hiddens, _ = self.lstm(packed)
         outputs = self.linear(hiddens[0])
         return outputs
 
     def sample(self, features, states=None):
-        """Samples SMILES tockens for given shape features (Greedy search)."""
-        sampled_ids = []
-        inputs = features.unsqueeze(1)
-        for i in range(62):
-            hiddens, states = self.lstm(inputs, states)
-            outputs = self.linear(hiddens.squeeze(1))
-            predicted = outputs.max(1)[1]
-            sampled_ids.append(predicted)
-            inputs = self.embed(predicted)
-            inputs = inputs.unsqueeze(1)
-        return sampled_ids
-
-    def sample_prob(self, features, states=None):
-        """Samples SMILES tockens for given shape features (probalistic picking)."""
+        """Samples captions for given image features (Greedy search)."""
         sampled_ids = []
         inputs = features.unsqueeze(1)
         for i in range(62):  # maximum sampling length
-            hiddens, states = self.lstm(inputs, states)
-            outputs = self.linear(hiddens.squeeze(1))
+            hiddens, states = self.lstm(inputs, states)  # (batch_size, 1, hidden_size),
+            outputs = self.linear(hiddens.squeeze(1))  # (batch_size, vocab_size)
+            predicted = outputs.max(1)[1]
+            sampled_ids.append(predicted)
+            inputs = self.embed(predicted)
+            inputs = inputs.unsqueeze(1)  # (batch_size, 1, embed_size)
+        return sampled_ids
+
+    def sample_prob(self, features, states=None):
+        """Samples captions for given image features (Greedy search)."""
+        sampled_ids = []
+        inputs = features.unsqueeze(1)
+        for i in range(62):  # maximum sampling length
+            hiddens, states = self.lstm(inputs, states)  # (batch_size, 1, hidden_size),
+            outputs = self.linear(hiddens.squeeze(1))  # (batch_size, vocab_size)
             if i == 0:
-                predicted = outputs.max(1)[1]
+                predicted = outputs.max(1)[1]  # Do not start w/ different than start!
             else:
                 probs = F.softmax(outputs, dim=1)
 
