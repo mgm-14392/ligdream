@@ -1,3 +1,14 @@
+# Captioning network for bicycleGAN for compound generator
+
+Libmolgrid implementation. To train you need a compressed sdf with 3D structures. I recommend reducing the number of channels, current implementation uses 15 where last channel is a void.
+
+bicycleGAN publication (all credit to authors):
+
+From Target to Drug: Generative Modeling for the Multimodal Structure-Based Ligand Design
+Miha Skalic, Davide Sabbadin, Boris Sattarov, Simone Sciabola, and Gianni De Fabritiis
+Molecular Pharmaceutics 2019 16 (10), 4282-4291
+DOI: 10.1021/acs.molpharmaceut.9b00634 
+
 # LigDream: Shape-Based Compound Generation
 
 ### Citing
