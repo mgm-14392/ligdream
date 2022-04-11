@@ -45,7 +45,7 @@ vae_model.train()
 
 # caption
 encoder = EncoderCNN_v3(15).to(device)
-decoder = DecoderRNN(512, 1024, 29, 1).to(device) #  input_dim=512, hidden_dim=1024, length_vocab=29, num_layers=1
+decoder = DecoderRNN(512, 1024, 29, 1).to(device)  # input_dim=512, hidden_dim=1024, length_vocab=29, num_layers=1
 
 criterion = nn.CrossEntropyLoss()
 caption_params = list(decoder.parameters()) + list(encoder.parameters())
@@ -56,27 +56,34 @@ decoder.train()
 
 models = [encoder, decoder, vae_model]
 
+
 def cross_entropy(real_tensor, fake_tensor, eps=1e-5):
-    CE = -1*((real_tensor * torch.log(fake_tensor + eps)).sum(dim=1).mean())
-    return CE
+    cross_ent = -1 * ((real_tensor * torch.log(fake_tensor + eps)).sum(dim=1).mean())
+    return cross_ent
+
 
 def KLD(mu, logvar):
-    KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
-    KLD = torch.sum(KLD_element).mul_(-0.5)
-    print('KLD alone %f' % KLD)
-    return KLD
+    # mean or sum?
+    _kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    print('KLD alone %f' % _kld.item)
+    return _kld
 
-def channel_pearson_corr(output_tensor,target_tensor):
+
+def channel_pearson_corr(output_tensor, target_tensor):
     # mean by channel and reshape to do substraction
-    voutput_tensor = output_tensor - output_tensor.mean(dim = [2,3,4]).view(output_tensor.shape[0], output_tensor.shape[1], 1, 1, 1)
-    vtarget_tensor = target_tensor - target_tensor.mean(dim = [2,3,4]).view(target_tensor.shape[0], target_tensor.shape[1], 1, 1, 1)
+    voutput_tensor = output_tensor - output_tensor.mean(dim=[2, 3, 4]) \
+        .view(output_tensor.shape[0], output_tensor.shape[1], 1, 1, 1)
+    vtarget_tensor = target_tensor - target_tensor.mean(dim=[2, 3, 4]) \
+        .view(target_tensor.shape[0], target_tensor.shape[1], 1, 1, 1)
     # pearson correlation between each channels but for all elements in the batch. cost.shape would be = [14]
     pc = torch.sum((voutput_tensor * vtarget_tensor),
-                   dim = [0,2,3,4]) / (torch.sqrt(torch.sum((voutput_tensor ** 2),
-                                                            dim = [0,2,3,4])) * torch.sqrt(torch.sum((vtarget_tensor ** 2),
-                                                                                                     dim = [0,2,3,4])))
+                   dim=[0, 2, 3, 4]) / (torch.sqrt(torch.sum((voutput_tensor ** 2),
+                                                             dim=[0, 2, 3, 4])) * torch.sqrt(
+        torch.sum((vtarget_tensor ** 2),
+                  dim=[0, 2, 3, 4])))
     # pearson correlation between each channels for each element in batch change dim to [2,3,4]. cost.shape would be = [batch_size,14]
     return pc
+
 
 # ----------
 #  Start data loader
@@ -85,19 +92,21 @@ def channel_pearson_corr(output_tensor,target_tensor):
 batch_size = args['batch_size']
 
 dataset = dataloader.CustomDataset(smiles_path, hdf5_path)
-dataloader = DataLoader(dataset, batch_size = batch_size, num_workers = args['num_workers'])
+dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=args['num_workers'])
+
 
 # Normalize tensor values
 def normVoid_tensor(input_tensor):
     # normalize?? this does not add to 1
-    input_tensor /= input_tensor.sum(axis = 1).max()
+    input_tensor /= input_tensor.sum(axis=1).max()
     # add void dimension
-    input_tensor = torch.cat((input_tensor, (1 - input_tensor.sum(dim = 1).unsqueeze(1))), axis=1)
+    input_tensor = torch.cat((input_tensor, (1 - input_tensor.sum(dim=1).unsqueeze(1))), axis=1)
     # clamp values
     input_tensor = torch.clamp(input_tensor, min=0, max=1)
     # normalize again adds to one
-    input_tensor /= input_tensor.sum(axis = 1).unsqueeze(1)
+    input_tensor /= input_tensor.sum(axis=1).unsqueeze(1)
     return input_tensor
+
 
 # ----------
 #  Training
@@ -108,21 +117,15 @@ caption_start = args['start_cap']
 epochs = args['epochs']
 number_iters = (500000 // batch_size) * int(epochs)
 
-# weight KLD
-def B_cycle_linear(n_iter, start=0.0, stop=1.0,  n_cycle=1, ratio=0.65):
-    L = np.ones(n_iter) * stop
-    period = n_iter/n_cycle
-    step = (stop-start)/(period*ratio) # linear schedule
 
-    for c in range(n_cycle):
-        v, i = start, 0
-        while v <= stop and (int(i+c*period) < n_iter):
-            L[int(i+c*period)] = v
-            v += step
-            i += 1
-    return L
+# weight KLD with values from sigmoid distribution
+def b_cycle_sigmiod(t_number_iters, range1, range2):
+    x = np.linspace(range1, range2, t_number_iters)
+    return 1 / (1 + np.exp(-x))
 
-B_values = B_cycle_linear(number_iters + 1)
+
+x = np.linspace(-10, 10, number_iters)
+B_values = 1/(1 + np.exp(-x))
 
 k = 0
 prev_time = time.time()
@@ -138,9 +141,9 @@ for epoch in range(0, epochs):
         vae_optimizer.zero_grad()
         recon_batch, mu, logvar = vae_model(dinput_tensor)
         CE = cross_entropy(dinput_tensor, recon_batch) * 100
-        B_i = (k if k <  number_iters else number_iters)
+        B_i = (k if k < number_iters else number_iters)
         _KLD = KLD(mu, logvar) * B_values[B_i]
-        vae_loss = (CE + _KLD ).to(device)
+        vae_loss = (CE + _KLD).to(device)
 
         print('vale_loss %f CE %f KLD %f b %f' % (vae_loss.item(), CE.item(), _KLD.item(), B_values[B_i]))
 
@@ -149,14 +152,14 @@ for epoch in range(0, epochs):
         recon_batch = recon_batch.detach()
 
         cPC = channel_pearson_corr(dinput_tensor, recon_batch)
-        print('PCSTART %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f'%(cPC[0], cPC[1], cPC[2],
-                                                                      cPC[3], cPC[4], cPC[5],
-                                                                      cPC[6], cPC[7], cPC[8],
-                                                                      cPC[9], cPC[10], cPC[11],
-                                                                      cPC[12], cPC[13], cPC[14]))
+        print('PCSTART %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f' % (cPC[0], cPC[1], cPC[2],
+                                                                        cPC[3], cPC[4], cPC[5],
+                                                                        cPC[6], cPC[7], cPC[8],
+                                                                        cPC[9], cPC[10], cPC[11],
+                                                                        cPC[12], cPC[13], cPC[14]))
 
         if epoch % 3 == 0 and k % 500 == 0:
-            torch.save(dinput_tensor, "shapes/ori_lig_%d-%d.pt" % (epoch,k))
+            torch.save(dinput_tensor, "shapes/ori_lig_%d-%d.pt" % (epoch, k))
             torch.save(recon_batch, "shapes/vae_lig_%d-%d.pt" % (epoch, k))
 
         # tensorboard to visualize the loss functions
@@ -165,10 +168,10 @@ for epoch in range(0, epochs):
 
         # count the time left
         iters_left = number_iters - k
-        time_left = datetime.timedelta(seconds = iters_left * (time.time()- prev_time))
+        time_left = datetime.timedelta(seconds=iters_left * (time.time() - prev_time))
         prev_time = time.time()
 
-        sys.stdout.write("\r[Epoch %d/%d] [Batch %d/%d] ETA: %s \n" %(epoch, epochs, k, number_iters, time_left))
+        sys.stdout.write("\r[Epoch %d/%d] [Batch %d/%d] ETA: %s \n" % (epoch, epochs, k, number_iters, time_left))
 
         if k == 500:
             for g in vae_optimizer.param_groups:
@@ -184,13 +187,13 @@ for epoch in range(0, epochs):
             targets = pack_padded_sequence(captions,
                                            lengths,
                                            batch_first=True,
-                                           enforce_sorted= False)[0] #shape = sum_length_sequences in batch
+                                           enforce_sorted=False)[0]  # shape = sum_length_sequences in batch
 
             decoder.zero_grad()
             encoder.zero_grad()
 
             features = encoder(recon_batch)
-            outputs = decoder(features, captions, lengths) # shape = sum_length_sequences in batch x vocab_length
+            outputs = decoder(features, captions, lengths)  # shape = sum_length_sequences in batch x vocab_length
             cap_loss = criterion(outputs, targets)
 
             cap_loss.backward()
@@ -203,7 +206,7 @@ for epoch in range(0, epochs):
             print('CaptionBCE: %f' % itcap_loss)
 
             # Reduce the LR
-            if epoch % 2 == 0 :
+            if epoch % 2 == 0:
                 for param_group in caption_optimizer.param_groups:
                     print('old capt lr ', str(param_group['lr']))
                     lr = param_group["lr"] / 2.
@@ -219,18 +222,18 @@ for epoch in range(0, epochs):
 
         # save networks every N iterations
         if epoch % 1 == 0 and k % 500 == 0:
-            torch.save({'epoch':k,
-                        'model_state_dict':vae_model.state_dict(),
-                        'optimizer_state_dict':vae_optimizer.state_dict()},
+            torch.save({'epoch': k,
+                        'model_state_dict': vae_model.state_dict(),
+                        'optimizer_state_dict': vae_optimizer.state_dict()},
                        "weights/VAE_%d-%d.pth" % (epoch, k))
             if epoch == caption_start:
-                torch.save({'epoch':k,
-                            'model_state_dict':encoder.state_dict(),
-                            'optimizer_state_dict':caption_optimizer.state_dict()},
+                torch.save({'epoch': k,
+                            'model_state_dict': encoder.state_dict(),
+                            'optimizer_state_dict': caption_optimizer.state_dict()},
                            "weights/encoder_%d-%d.pth" % (epoch, k))
-                torch.save({'epoch':k,
-                            'model_state_dict':decoder.state_dict(),
-                            'optimizer_state_dict':caption_optimizer.state_dict()},
-                           "weights/decoder_%d-%d.pth" % (epoch,k))
+                torch.save({'epoch': k,
+                            'model_state_dict': decoder.state_dict(),
+                            'optimizer_state_dict': caption_optimizer.state_dict()},
+                           "weights/decoder_%d-%d.pth" % (epoch, k))
 
         k += 1

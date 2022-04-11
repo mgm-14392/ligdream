@@ -5,13 +5,14 @@
 # Modification of the original code to use libmolgrid for input preparation 8/04/22
 
 import molgrid
-from molgrid import Coords2GridFunction
 import baseoptions
 import numpy as np
 import torch
 import pybel
 from rdkit import Chem
-
+import h5py
+from scipy.spatial.transform import Rotation
+import random
 
 args = baseoptions.BaseOptions().create_parser()
 
@@ -43,8 +44,8 @@ def smiles_to_np(text):
 
     sstring = makecanonical(text)
 
-    sstring = sstring.replace("Cl", "X").replace("[nH]", "Y").\
-        replace("Br", "Z").replace("[PH]", "P").\
+    sstring = sstring.replace("Cl", "X").replace("[nH]", "Y"). \
+        replace("Br", "Z").replace("[PH]", "P"). \
         replace("[SH]", "S").replace("[S]", "S")
 
     try:
@@ -71,22 +72,52 @@ def get_mol(smile, h5file):
     return endstring
 
 
-def coords2grid(text, hdf5_file, resolution=args['grid_resol'], dimension=args['grid_dim']):
+def rotate(coords, alpha, beta, gamma):
+    r = Rotation.from_euler('zyx', [alpha, beta, gamma], degrees=True)
+    com = coords.mean(axis=0)
+    coords_0 = coords - com
+    return r.apply(coords_0) + com
 
+
+def coords2grid(text, hdf5_file, resolution=args['grid_resol'], dimension=args['grid_dim'], rotation=args['rotation']):
     smiles = text.strip()
     g_mol = get_mol(smiles, hdf5_file)
     mol = pybel.readstring('sdf', g_mol)
 
-    crds = molgrid.CoordinateSet(mol.OBMol, molgrid.defaultGninaLigandTyper)
-    crds.make_vector_types()
-    center = tuple(crds.center())
-    coordinates = torch.tensor(crds.coords.tonumpy())
-    radii = torch.tensor(crds.radii.tonumpy())
-    types = torch.tensor(crds.type_vector.tonumpy())
+    # ROTATION
+    c = molgrid.CoordinateSet(mol)
 
-    # initialize gridMaker
+    if rotation:
+        t = molgrid.Transform(molgrid.Quaternion(random.uniform(0, 10), random.uniform(0, 10), random.uniform(0, 10),
+                                                 random.uniform(0, 10)), (0, 0, 0), (0, 0, 0))
+        t.forward(c, c)
+
     gmaker = molgrid.GridMaker(resolution=resolution, dimension=dimension, binary=False,
                                radius_type_indexed=False, radius_scale=1.0, gaussian_radius_multiple=1.0)
 
-    grid = Coords2GridFunction.apply(gmaker, center, coordinates, types, radii)
-    return grid
+    dims = gmaker.grid_dimensions(molgrid.defaultGninaLigandTyper.num_types())
+    gridtensor = torch.zeros(dims, dtype=torch.float32)
+    gmaker.forward(c.center(), c, gridtensor)
+
+    # NO ROTATION
+    # crds = molgrid.CoordinateSet(mol.OBMol, molgrid.defaultGninaLigandTyper)
+    # crds.make_vector_types()
+    # center = tuple(crds.center())
+    # coordinates = torch.tensor(crds.coords.tonumpy())
+    # radii = torch.tensor(crds.radii.tonumpy())
+    # types = torch.tensor(crds.type_vector.tonumpy())
+
+    # gmaker = molgrid.GridMaker(resolution = resolution, dimension = dimension, binary=False,
+    #                       radius_type_indexed=False, radius_scale=1.0, gaussian_radius_multiple=1.0)
+
+    # grid = Coords2GridFunction.apply(gmaker, center, coordinates, types, radii)
+
+    # torch.save(grid, "NOTrot_check.pt")
+    return gridtensor
+
+
+if __name__ == '__main__':
+    smi = 'C=CCN1C(=O)c2ccc(C(=O)OCC(=O)N3CCN(S(=O)(=O)c4ccccc4)CC3)cc2C1=O'
+    _h5_gen = h5py.File('/c7/scratch2/Mariana/cnns/datacaptionnetwork/MolPort_ligs/Prep/capNWdatav3.hdf5', 'r')
+    grid = coords2grid(smi, _h5_gen, resolution=1.0, dimension=23, rotation=True)
+    torch.save(grid, "NOrot.pt")
