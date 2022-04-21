@@ -27,9 +27,9 @@ def filter_unique_canonical(in_mols):
     return [Chem.MolFromSmiles(x) for x in set(xresults)]  # Check for duplicates and filter out invalids
 
 
-def get_smi_3D_voxels(smiles, eval=False, filename_hdf5=None):
+def get_smi_3D_voxels(smiles, filename_hdf5=None, evaluate=False):
     # SMILES to 3D with openbabel
-    if eval:
+    if evaluate:
 
         smiles = makecanonical(smiles)
         mol = pybel.readstring('smi', smiles)
@@ -109,9 +109,12 @@ class CompoundGenerator:
         :param decoder_weights: str - captioning model decoder model weights path
         :return: None
         """
-        self.vae_model.load_state_dict(torch.load(vae_weights, map_location='cpu'))
-        self.encoder.load_state_dict(torch.load(encoder_weights, map_location='cpu'))
-        self.decoder.load_state_dict(torch.load(decoder_weights, map_location='cpu'))
+        self.vae_model.load_state_dict(vae_weights['model_state_dict'])
+        self.vae_model.eval()
+        self.encoder.load_state_dict(encoder_weights['model_state_dict'])
+        self.encoder.eval()
+        self.decoder.load_state_dict(decoder_weights['model_state_dict'])
+        self.decoder.eval()
 
     def caption_shape(self, in_shapes, probab=False):
         """
@@ -130,7 +133,7 @@ class CompoundGenerator:
             captions = captions.data.numpy()
         return decode_smiles(captions)
 
-    def generate_molecules(self, smile_str, n_attemps=1, probab=False, filter_unique_valid=True):
+    def generate_molecules(self, shape, n_attemps=1, probab=False, filter_unique_valid=True):
         """
         Generate novel compounds from a seed compound.
         :param smile_str: string - SMILES representation of a molecule
@@ -140,16 +143,30 @@ class CompoundGenerator:
         :return: list of RDKit molecules.
         """
 
-        shape_input = get_smi_3D_voxels(smile_str)
+        shape_input = shape
         if self.use_cuda:
             shape_input = shape_input.cuda()
 
         shape_input = shape_input.unsqueeze(0).repeat(n_attemps, 1, 1, 1, 1)
 
-        shape_input = Variable(shape_input, volatile=True)
+        shape_input = Variable(shape_input)
 
         recoded_shapes, _, _ = self.vae_model(shape_input)
         smiles = self.caption_shape(recoded_shapes, probab=probab)
         if filter_unique_valid:
             return filter_unique_canonical(smiles)
         return [Chem.MolFromSmiles(x) for x in smiles]
+
+if __name__ == '__main__':
+    filename_hdf5 = ''
+    smiles = ''
+    vae_weights = ''
+    encoder_weights = ''
+    decoder_weights = ''
+
+    CompoundGenerator.load_weight(vae_weights, encoder_weights, decoder_weights)
+    shape = get_smi_3D_voxels(smiles, filename_hdf5, False)
+    generated_smiles = CompoundGenerator.generate_molecules(shape)
+
+
+
