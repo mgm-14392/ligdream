@@ -94,6 +94,7 @@ batch_size = args['batch_size']
 dataset = dataloader.CustomDataset(smiles_path, hdf5_path)
 dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=args['num_workers'])
 
+number_ligs = len(dataloader.dataset)
 
 # Normalize tensor values
 def normVoid_tensor(input_tensor):
@@ -115,14 +116,7 @@ def normVoid_tensor(input_tensor):
 # start to train caption network after iteration=caption_start
 caption_start = args['start_cap']
 epochs = args['epochs']
-number_iters = (500000 // batch_size) * int(epochs)
-
-
-# weight KLD with values from sigmoid distribution
-def b_cycle_sigmiod(t_number_iters, range1, range2):
-    x = np.linspace(range1, range2, t_number_iters)
-    return 1 / (1 + np.exp(-x))
-
+number_iters = (number_ligs // batch_size) * int(epochs)
 
 x = np.linspace(-10, 10, number_iters)
 B_values = 1/(1 + np.exp(-x))
@@ -141,7 +135,7 @@ for epoch in range(0, epochs):
         vae_optimizer.zero_grad()
         recon_batch, mu, logvar = vae_model(dinput_tensor)
         CE = cross_entropy(dinput_tensor, recon_batch) * 100
-        B_i = (k if k < number_iters else number_iters)
+        B_i = (k if k < number_iters else (number_iters-1))
         _KLD = KLD(mu, logvar) * B_values[B_i]
         vae_loss = (CE + _KLD).to(device)
 

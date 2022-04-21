@@ -4,8 +4,8 @@
 # Modified from Ligdream (https://github.com/compsciencelab/ligdream)
 # Modification of the original code to use libmolgrid for input preparation 8/04/22
 
-from networks import EncoderCNN, DecoderRNN, LigandVAE
-from generators import makecanonical
+from networks import EncoderCNN_v3, DecoderRNN, VAE
+from generators import makecanonical, get_mol, coords2grid
 from decoding import decode_smiles
 from torch.autograd import Variable
 import molgrid
@@ -14,6 +14,7 @@ import torch
 import pybel
 from rdkit import Chem
 import sys
+import h5py
 
 
 def filter_unique_canonical(in_mols):
@@ -26,50 +27,68 @@ def filter_unique_canonical(in_mols):
     return [Chem.MolFromSmiles(x) for x in set(xresults)]  # Check for duplicates and filter out invalids
 
 
-def get_mol_voxels(smiles):
+def get_smi_3D_voxels(smiles, eval=False, filename_hdf5=None):
     # SMILES to 3D with openbabel
+    if eval:
 
-    smiles = makecanonical(smiles)
-    mol = pybel.readstring('smi', smiles)
-    mol.addh()
+        smiles = makecanonical(smiles)
+        mol = pybel.readstring('smi', smiles)
+        mol.addh()
 
-    ff = pybel._forcefields["mmff94"]
-    success = ff.Setup(mol.OBMol)
-    if not success:
-        ff = pybel._forcefields["uff"]
+        ff = pybel._forcefields["mmff94"]
         success = ff.Setup(mol.OBMol)
         if not success:
-            sys.exit("Cannot set up forcefield")
+            ff = pybel._forcefields["uff"]
+            success = ff.Setup(mol.OBMol)
+            if not success:
+                sys.exit("Cannot set up forcefield")
 
-    ff.ConjugateGradients(100, 1.0e-3)  # optimize geometry
-    ff.WeightedRotorSearch(100, 25)  # generate conformers
-    ff.ConjugateGradients(250, 1.0e-4)
-    ff.GetCoordinates(mol.OBMol)
+        ff.ConjugateGradients(100, 1.0e-3)  # optimize geometry
+        ff.WeightedRotorSearch(100, 25)  # generate conformers
+        ff.ConjugateGradients(250, 1.0e-4)
+        ff.GetCoordinates(mol.OBMol)
 
-    # get 3D coords
-    crds = molgrid.CoordinateSet(mol.OBMol, molgrid.defaultGninaLigandTyper)
-    crds.make_vector_types()
-    center = tuple(crds.center())
-    coordinates = torch.tensor(crds.coords.tonumpy())
-    radii = torch.tensor(crds.radii.tonumpy())
-    types = torch.tensor(crds.type_vector.tonumpy())
+        # get 3D coords
+        #crds = molgrid.CoordinateSet(mol.OBMol, molgrid.defaultGninaLigandTyper)
+        crds = molgrid.CoordinateSet(mol.OBMol)
 
-    # initialize gridMaker
+    else:
+        hdf5_file = h5py.File(filename_hdf5, 'r')
+        g_mol = get_mol(smiles, hdf5_file)
+        mol = pybel.readstring('sdf', g_mol)
+        crds = molgrid.CoordinateSet(mol)
+
+
     gmaker = molgrid.GridMaker(resolution=1, dimension=23, binary=False,
                                radius_type_indexed=False, radius_scale=1.0,
                                gaussian_radius_multiple=1.0)
 
-    grid = Coords2GridFunction.apply(gmaker, center, coordinates, types, radii)
-    return grid
+    dims = gmaker.grid_dimensions(molgrid.defaultGninaLigandTyper.num_types())
+    gridtensor = torch.zeros(dims, dtype=torch.float32)
+    gmaker.forward(crds.center(), crds, gridtensor)
+
+    #crds.make_vector_types()
+    #center = tuple(crds.center())
+    #coordinates = torch.tensor(crds.coords.tonumpy())
+    #radii = torch.tensor(crds.radii.tonumpy())
+    #types = torch.tensor(crds.type_vector.tonumpy())
+
+    # initialize gridMaker
+    #gmaker = molgrid.GridMaker(resolution=1, dimension=23, binary=False,
+    #                           radius_type_indexed=False, radius_scale=1.0,
+    #                           gaussian_radius_multiple=1.0)
+
+    #grid = Coords2GridFunction.apply(gmaker, center, coordinates, types, radii)
+    return gridtensor
 
 
 class CompoundGenerator:
     def __init__(self, use_cuda=True):
 
         self.use_cuda = False
-        self.encoder = EncoderCNN(15)
+        self.encoder = EncoderCNN_v3(15)
         self.decoder = DecoderRNN(512, 1024, 29, 1)
-        self.vae_model = LigandVAE()
+        self.vae_model = VAE()
 
         self.vae_model.eval()
         self.encoder.eval()
@@ -111,29 +130,25 @@ class CompoundGenerator:
             captions = captions.data.numpy()
         return decode_smiles(captions)
 
-    def generate_molecules(self, smile_str, n_attemps=300, lam_fact=1., probab=False, filter_unique_valid=True):
+    def generate_molecules(self, smile_str, n_attemps=1, probab=False, filter_unique_valid=True):
         """
         Generate novel compounds from a seed compound.
         :param smile_str: string - SMILES representation of a molecule
         :param n_attemps: int - number of decoding attempts
-        :param lam_fact: float - latent space pertrubation factor
         :param probab: boolean - use probabilistic decoding
         :param filter_unique_valid: boolean - filter for valid and unique molecules
         :return: list of RDKit molecules.
         """
 
-        shape_input, cond_input = get_mol_voxels(smile_str)
+        shape_input = get_smi_3D_voxels(smile_str)
         if self.use_cuda:
             shape_input = shape_input.cuda()
-            cond_input = cond_input.cuda()
 
         shape_input = shape_input.unsqueeze(0).repeat(n_attemps, 1, 1, 1, 1)
-        cond_input = cond_input.unsqueeze(0).repeat(n_attemps, 1, 1, 1, 1)
 
         shape_input = Variable(shape_input, volatile=True)
-        cond_input = Variable(cond_input, volatile=True)
 
-        recoded_shapes, _, _ = self.vae_model(shape_input, cond_input, lam_fact)
+        recoded_shapes, _, _ = self.vae_model(shape_input)
         smiles = self.caption_shape(recoded_shapes, probab=probab)
         if filter_unique_valid:
             return filter_unique_canonical(smiles)

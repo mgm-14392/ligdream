@@ -11,7 +11,6 @@ import torch
 import pybel
 from rdkit import Chem
 import h5py
-from scipy.spatial.transform import Rotation
 import random
 
 args = baseoptions.BaseOptions().create_parser()
@@ -70,13 +69,6 @@ def get_mol(smile, h5file):
     for line in dataset:
         endstring += line.decode()
     return endstring
-
-
-def rotate(coords, alpha, beta, gamma):
-    r = Rotation.from_euler('zyx', [alpha, beta, gamma], degrees=True)
-    com = coords.mean(axis=0)
-    coords_0 = coords - com
-    return r.apply(coords_0) + com
 
 
 def coords2grid(text, hdf5_file, resolution=args['grid_resol'], dimension=args['grid_dim'], rotation=args['rotation']):
